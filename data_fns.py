@@ -439,6 +439,9 @@ class FeatureData:
 
 </div>
 """
+        # idk why this bug is here, for representing newlines the wrong way
+        html_string = html_string.replace("Ċ", "&bsol;n")
+        
         if debug:
             display(HTML(html_string))
 
