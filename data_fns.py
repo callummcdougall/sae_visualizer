@@ -60,6 +60,12 @@ class HistogramData:
     '''
     def __init__(self, data: Tensor, n_bins: int, tickmode: str):
 
+        if data.numel() == 0:
+            self.bar_heights = []
+            self.bar_values = []
+            self.tick_vals = []
+            return
+
         # Get min and max of data
         max_value = data.max().item()
         min_value = data.min().item()
@@ -275,14 +281,14 @@ class FeatureData:
 
 
     @classmethod
-    def save_batch(cls, batch: Dict[int, "FeatureData"], filename: str, save_type: Literal["pkl", "pkl-1", "gzip"]) -> None:
+    def save_batch(cls, batch: Dict[int, "FeatureData"], filename: str, save_type: Literal["pkl", "gzip"]) -> None:
         '''Saves a batch of FeatureData objects to a pickle file.'''
         assert "." not in filename, "You should pass in the filename without the extension."
-        filename = filename + ".pkl" if save_type.startswith("pkl") else filename + ".pkl.gz"
+        filename = filename + ".pkl" if (save_type == "pkl") else filename + ".pkl.gz"
         save_obj = {k: v.return_save_dict() for k, v in batch.items()}
-        if save_type.startswith("pkl"):
+        if save_type == "pkl":
             with open(filename, "wb") as f:
-                pickle.dump(save_obj, f, protocol=-1 if save_type=="pkl-1" else None)
+                pickle.dump(save_obj, f)
         elif save_type == "gzip":
             with gzip.open(filename, "wb") as f:
                 pickle.dump(save_obj, f)
@@ -290,7 +296,7 @@ class FeatureData:
     
 
     @classmethod
-    def load_batch(cls, filename: str, save_type: Literal["pkl", "pkl-1", "gzip"], vocab_dict: Dict[int, str], feature_idx: Optional[int] = None) -> Union["FeatureData", Dict[int, "FeatureData"]]:
+    def load_batch(cls, filename: str, save_type: Literal["pkl", "gzip"], vocab_dict: Dict[int, str], feature_idx: Optional[int] = None) -> Union["FeatureData", Dict[int, "FeatureData"]]:
         '''Loads a batch of FeatureData objects from a pickle file.'''
         assert "." not in filename, "You should pass in the filename without the extension."
         filename = filename + ".pkl" if save_type.startswith("pkl") else filename + ".pkl.gz"
@@ -307,14 +313,14 @@ class FeatureData:
             return FeatureData.load_from_save_dict(save_obj[feature_idx], vocab_dict)
 
 
-    def save(self, filename: str, save_type: Literal["pkl", "pkl-1", "gzip"]) -> None:
+    def save(self, filename: str, save_type: Literal["pkl", "gzip"]) -> None:
         '''Saves this object to a pickle file (we don't need to save the model and encoder too, just the data).'''
         assert "." not in filename, "You should pass in the filename without the extension."
-        filename = filename + ".pkl" if save_type.startswith("pkl") else filename + ".pkl.gz"
+        filename = filename + ".pkl" if (save_type == "pkl") else filename + ".pkl.gz"
         save_obj = self.return_save_dict()
         if save_type.startswith("pkl"):
             with open(filename, "wb") as f:
-                pickle.dump(save_obj, f, protocol=-1 if save_type=="pkl-1" else None)
+                pickle.dump(save_obj, f)
         elif save_type == "gzip":
             with gzip.open(filename, "wb") as f:
                 pickle.dump(save_obj, f)
@@ -655,6 +661,7 @@ def get_feature_data(
 
 
     # ! Calculate all data for the right-hand visualisations, i.e. the sequences
+    # TODO - parallelize this (it could probably be sped up by batching indices & doing all sequences at once, although those would be large tensors)
     # We do this in 2 steps:
     #   (1) get the indices per group, from the feature activations, for each of the 12 groups (top, bottom, 10 quantiles)
     #   (2) get a batch of SequenceData objects per group. This usually involves using eindex (i.e. indexing into the `tensors`
@@ -665,11 +672,7 @@ def get_feature_data(
 
     iterator = range(n_feats) if not(verbose) else tqdm(range(n_feats), desc="Getting sequence data", leave=False)
 
-    my_times = torch.zeros(2)
-
     for feat in iterator:
-
-        t_one = time.time()
 
         _feat_acts = feat_acts[..., feat] # [batch seq]
             
@@ -678,7 +681,7 @@ def get_feature_data(
             f"TOP ACTIVATIONS<br>MAX = {_feat_acts.max():.3f}": k_largest_indices(_feat_acts, k=first_group_size, largest=True),
             f"BOTTOM ACTIVATIONS<br>MIN = {_feat_acts.min():.3f}": k_largest_indices(_feat_acts, k=first_group_size, largest=False),
         }
-        
+
         quantiles = torch.linspace(0, _feat_acts.max(), n_groups+1)
         for i in range(n_groups-1, -1, -1):
             lower, upper = quantiles[i:i+2]
@@ -686,71 +689,65 @@ def get_feature_data(
             indices = random_range_indices(_feat_acts, (lower, upper), k=other_groups_size)
             indices_dict[f"INTERVAL {lower:.3f} - {upper:.3f}<br>CONTAINS {pct:.3%}"] = indices
 
-        t_two = time.time()
+        # Concat all the indices together (in the next steps we do all groups at once)
+        indices_full = torch.concat(list(indices_dict.values()))
 
         # (2)
+        # ! We further split (2) up into 3 sections:
+        #   (A) calculate the indices we'll use for this group (we need to get a buffer on either side of the target token for each seq),
+        #       i.e. indices[..., 0] = shape (g, buf) contains the batch indices of the sequences, and indices[..., 1] = contains seq indices
+        #   (B) index into all our tensors to get the relevant data (this includes calculating the effect of ablation)
+        #   (C) construct the SequenceData objects, in the form of a SequenceDataBatch object
+        
+        # (A)
+        # For each token index [batch, seq], we actually want [[batch, seq-buffer[0]], ..., [batch, seq], ..., [batch, seq+buffer[1]]]
+        # We get one extra dimension at the start, because we need to see the effect on loss of the first token
+        buffer_tensor = torch.arange(-buffer[0] - 1, buffer[1] + 1, device=indices_full.device)
+        indices_full = einops.repeat(indices_full, "g two -> g buf two", buf=buffer[0] + buffer[1] + 2)
+        indices_full = torch.stack([indices_full[..., 0], indices_full[..., 1] + buffer_tensor], dim=-1).cpu()
+
+        # (B)
+        # Template for indexing is new_tensor[k, seq] = tensor[indices_full[k, seq, 1], indices_full[k, seq, 2]], sometimes there's an extra dim at the end
+        tokens_group = eindex(tokens, indices_full[:, 1:], "[g buf 0] [g buf 1]")
+        feat_acts_group = eindex(_feat_acts, indices_full, "[g buf 0] [g buf 1]")
+        resid_post_group = eindex(resid_post, indices_full, "[g buf 0] [g buf 1] d_model")
+
+        # From these feature activations, get the actual contribution to the final value of the residual stream
+        resid_post_feature_effect = einops.einsum(feat_acts_group, feature_mlp_out_dir[feat], "g buf, d_model -> g buf d_model")
+        # Get the resulting new logits (by subtracting this effect from resid_post, then applying layernorm & unembedding)
+        new_resid_post = resid_post_group - resid_post_feature_effect
+        new_logits = (new_resid_post / new_resid_post.std(dim=-1, keepdim=True)) @ model.W_U
+        orig_logits = (resid_post_group / resid_post_group.std(dim=-1, keepdim=True)) @ model.W_U
+
+        # Get the top5 & bottom5 changes in logits
+        # note - changes in logits are for hovering over predict-ING token, so it should align w/ tokens_group, hence we slice [:, 1:]
+        contribution_to_logprobs = orig_logits.log_softmax(dim=-1) - new_logits.log_softmax(dim=-1)
+        top5_contribution_to_logits = TopK(contribution_to_logprobs[:, :-1].topk(k=5, largest=True))
+        bottom5_contribution_to_logits = TopK(contribution_to_logprobs[:, :-1].topk(k=5, largest=False))
+        # Get the change in loss (which is negative of change of logprobs for correct token)
+        # note - changes in loss are for underlining predict-ED token, hence we slice [:, :-1]
+        contribution_to_loss = eindex(-contribution_to_logprobs[:, :-1], tokens_group, "g buf [g buf]")
+
+        # (C)
+        # Now that we've indexed everything, construct the batch of SequenceData objects
         sequence_data = {}
+        g_total = 0
         for group_name, indices in indices_dict.items():
-            # ! We further split (2) up into 3 sections:
-            #   (A) calculate the indices we'll use for this group (we need to get a buffer on either side of the target token for each seq),
-            #       i.e. indices[..., 0] = shape (g, buf) contains the batch indices of the sequences, and indices[..., 1] = contains seq indices
-            #   (B) index into all our tensors to get the relevant data (this includes calculating the effect of ablation)
-            #   (C) construct the SequenceData objects, in the form of a SequenceDataBatch object
-            
-            # (A)
-            # For each token index [batch, seq], we actually want [[batch, seq-buffer[0]], ..., [batch, seq], ..., [batch, seq+buffer[1]]]
-            # We get one extra dimension at the start, because we need to see the effect on loss of the first token
-
-
-            buffer_tensor = torch.arange(-buffer[0] - 1, buffer[1] + 1, device=indices.device)
-            indices = einops.repeat(indices, "g two -> g buf two", buf=buffer[0] + buffer[1] + 2)
-            indices = torch.stack([indices[..., 0], indices[..., 1] + buffer_tensor], dim=-1).cpu()
-
-            # (B)
-            # Template for indexing is new_tensor[k, seq] = tensor[indices[k, seq, 1], indices[k, seq, 2]], sometimes there's an extra dim at the end
-            tokens_group = eindex(tokens, indices[:, 1:], "[g buf 0] [g buf 1]")
-            feat_acts_group = eindex(_feat_acts, indices, "[g buf 0] [g buf 1]")
-            resid_post_group = eindex(resid_post, indices, "[g buf 0] [g buf 1] d_model")
-
-            # From these feature activations, get the actual contribution to the final value of the residual stream
-            resid_post_feature_effect = einops.einsum(feat_acts_group, feature_mlp_out_dir[feat], "g buf, d_model -> g buf d_model")
-            # Get the resulting new logits (by subtracting this effect from resid_post, then applying layernorm & unembedding)
-            new_resid_post = resid_post_group - resid_post_feature_effect
-            new_logits = (new_resid_post / new_resid_post.std(dim=-1, keepdim=True)) @ model.W_U
-            orig_logits = (resid_post_group / resid_post_group.std(dim=-1, keepdim=True)) @ model.W_U
-
-            # Get the top5 & bottom5 changes in logits
-            # note - changes in logits are for hovering over predict-ING token, so it should align w/ tokens_group, hence we slice [:, 1:]
-            contribution_to_logprobs = orig_logits.log_softmax(dim=-1) - new_logits.log_softmax(dim=-1)
-            top5_contribution_to_logits = TopK(contribution_to_logprobs[:, :-1].topk(k=5, largest=True))
-            bottom5_contribution_to_logits = TopK(contribution_to_logprobs[:, :-1].topk(k=5, largest=False))
-            # Get the change in loss (which is negative of change of logprobs for correct token)
-            # note - changes in loss are for underlining predict-ED token, hence we slice [:, :-1]
-            contribution_to_loss = eindex(-contribution_to_logprobs[:, :-1], tokens_group, "g buf [g buf]")
-
-            # (3)
-            # Now that we've indexed everything, construct the batch of SequenceData objects
+            lower, upper = g_total, g_total + len(indices)
             sequence_data[group_name] = SequenceDataBatch(
-                token_ids=tokens_group.tolist(),
-                feat_acts=feat_acts_group[:, 1:].tolist(),
-                contribution_to_loss=contribution_to_loss.tolist(),
+                token_ids=tokens_group[lower: upper].tolist(),
+                feat_acts=feat_acts_group[lower: upper, 1:].tolist(),
+                contribution_to_loss=contribution_to_loss[lower: upper].tolist(),
                 repeat=False,
-                top5_token_ids=top5_contribution_to_logits.indices.tolist(),
-                top5_logit_contributions=top5_contribution_to_logits.values.tolist(),
-                bottom5_token_ids=bottom5_contribution_to_logits.indices.tolist(),
-                bottom5_logit_contributions=bottom5_contribution_to_logits.values.tolist(),
+                top5_token_ids=top5_contribution_to_logits.indices[lower: upper].tolist(),
+                top5_logit_contributions=top5_contribution_to_logits.values[lower: upper].tolist(),
+                bottom5_token_ids=bottom5_contribution_to_logits.indices[lower: upper].tolist(),
+                bottom5_logit_contributions=bottom5_contribution_to_logits.values[lower: upper].tolist(),
             )
+            g_total += len(indices)
 
         # Add this feature's sequence data to the list
         sequence_data_list.append(sequence_data)
-
-        t_three = time.time()
-
-        my_times[0] += t_three - t_two
-        my_times[1] += t_two - t_one
-
-    for s, my_time in zip(["first", "second"], my_times):
-        print(f"{s}: {my_time:.3f}")
 
     t5 = time.time()
 
@@ -840,7 +837,7 @@ def get_feature_data(
             print(f"Estimated filesize of all {n_feats_total} features if saved in groups of batch_size, with save type...")
             save_obj = {k: v for k, v in return_obj.items() if k in feature_idx[:batch_size]}
             filename = str(Path(__file__).parent.resolve() / "temp")
-            for save_type in ["pkl", "pkl-1", "gzip"]:
+            for save_type in ["pkl", "gzip"]:
                 t0 = time.time()
                 full_filename = FeatureData.save_batch(save_obj, filename=filename, save_type=save_type)
                 t1 = time.time()
