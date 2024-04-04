@@ -1,3 +1,5 @@
+**Note** - this repo is depreciated, see [here](https://github.com/callummcdougall/sae_vis) for the more up to date version.
+
 This repository allows you to create visualisations of the features found by a sparse autoencoder, like the one below (link [here](https://www.perfectlynormal.co.uk/blog-sae)).
 
 <img src="https://raw.githubusercontent.com/callummcdougall/computational-thread-art/master/example_images/misc/image_sae.png" width="900">
